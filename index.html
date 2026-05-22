@@ -657,6 +657,9 @@ ORDER BY Total DESC"
           <span class="lbadge">HDB SQL</span>
         </div>
         <div class="p-actions">
+          <button class="pbtn" id="fmt-hana-btn" title="Formatar SQL">
+            <span>✦</span><span> Formatar</span>
+          </button>
           <button class="pbtn" id="cpy-hana-btn" title="Copiar resultado (Ctrl+Shift+C)">
             <span>⎘</span><span> Copiar</span>
           </button>
@@ -700,6 +703,10 @@ ORDER BY Total DESC"
       <span class="sc-item">
         <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">Shift</kbd>+<kbd class="kbd">C</kbd>
         <span style="margin-left:4px">Copiar HANA</span>
+      </span>
+      <span class="sc-item">
+        <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">Shift</kbd>+<kbd class="kbd">F</kbd>
+        <span style="margin-left:4px">Formatar</span>
       </span>
       <span class="sc-item">
         <kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">L</kbd>
@@ -1121,8 +1128,23 @@ document.getElementById('clr-hana-btn').addEventListener('click', () => {
    FORMAT (placeholder)
    ============================================================ */
 document.getElementById('fmt-btn').addEventListener('click', () => {
-  if (!sqlInput.value.trim()) { toast('Nada para formatar', 'warning'); return; }
-  toast('Formatação automática de SQL em breve! (em desenvolvimento)', 'info', 3200);
+  const raw = sqlInput.value.trim();
+  if (!raw) { toast('Nada para formatar', 'warning'); return; }
+  const formatted = formatSQL(raw);
+  if (formatted === raw) { toast('Query já está formatada', 'info'); return; }
+  sqlInput.value = formatted;
+  refreshSql();
+  toast('SQL formatado ✦', 'ok');
+});
+
+document.getElementById('fmt-hana-btn').addEventListener('click', () => {
+  const raw = hanaOutput.value.trim();
+  if (!raw) { toast('Nada para formatar', 'warning'); return; }
+  const formatted = formatSQL(raw);
+  if (formatted === raw) { toast('Query já está formatada', 'info'); return; }
+  hanaOutput.value = formatted;
+  refreshHana();
+  toast('HANA formatado ✦', 'ok');
 });
 
 /* ============================================================
@@ -1449,6 +1471,149 @@ function splitArgs(str) {
   return args;
 }
 
+/* ============================================================
+   SQL FORMATTER
+   ============================================================ */
+
+/* Divide condições WHERE/HAVING por AND/OR no nível 0 de parênteses,
+   ignorando o AND que pertence a BETWEEN...AND                      */
+function splitConditions(cond) {
+  const parts = [];
+  let cur = '', depth = 0, inBetween = false, i = 0;
+  while (i < cond.length) {
+    if (cond[i] === '(') { depth++; cur += cond[i++]; continue; }
+    if (cond[i] === ')') { depth--; cur += cond[i++]; continue; }
+    if (depth === 0) {
+      const rest = cond.slice(i);
+      /* Marca BETWEEN para proteger seu AND */
+      if (/^BETWEEN\b/i.test(rest)) {
+        inBetween = true;
+        cur += rest.slice(0, 7); i += 7; continue;
+      }
+      const m = rest.match(/^(AND|OR)\s+/i);
+      if (m) {
+        if (inBetween && /^AND/i.test(m[0])) {
+          /* AND pertence ao BETWEEN — não é separador de condição */
+          inBetween = false;
+          cur += m[0]; i += m[0].length; continue;
+        }
+        if (cur.trim()) parts.push(cur.trimEnd());
+        cur = m[0]; i += m[0].length; continue;
+      }
+    }
+    cur += cond[i++];
+  }
+  if (cur.trim()) parts.push(cur.trim());
+  return parts;
+}
+
+/* Formata SQL em multilinha legível, respeitando:
+   · Literais protegidos (strings, identificadores com aspas)
+   · Parênteses aninhados (FROM dentro de EXTRACT não vira newline)
+   · BETWEEN ... AND (o AND não é separador de condição)            */
+function formatSQL(sql) {
+  if (!sql || !sql.trim()) return sql;
+  getCfg();
+  const ind = ' '.repeat(cfg.indent || 4);
+  const [safe, restore] = protectLiterals(sql.trim());
+  let s = safe;
+
+  /* 1. Colapsa quebras de linha e espaços múltiplos */
+  s = s.replace(/\r?\n/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+  /* 2. Normaliza keywords compostas em tokens sem espaço interno
+        (garante matching sem ambiguidade no scan seguinte)          */
+  s = s.replace(/\bORDER\s+BY\b/gi,              '@@ORDERBY@@');
+  s = s.replace(/\bGROUP\s+BY\b/gi,              '@@GROUPBY@@');
+  s = s.replace(/\bINNER\s+JOIN\b/gi,            '@@INNERJOIN@@');
+  s = s.replace(/\bLEFT\s+(?:OUTER\s+)?JOIN\b/gi,'@@LEFTJOIN@@');
+  s = s.replace(/\bRIGHT\s+(?:OUTER\s+)?JOIN\b/gi,'@@RIGHTJOIN@@');
+  s = s.replace(/\bFULL\s+(?:OUTER\s+)?JOIN\b/gi,'@@FULLJOIN@@');
+  s = s.replace(/\bCROSS\s+JOIN\b/gi,            '@@CROSSJOIN@@');
+
+  /* 3. Scan com profundidade de parênteses — insere \n antes de
+        cláusulas de nível 0 (FROM dentro de EXTRACT fica intacto) */
+  const CLAUSES = [
+    ['@@ORDERBY@@',   'ORDER BY'],
+    ['@@GROUPBY@@',   'GROUP BY'],
+    ['@@INNERJOIN@@', 'INNER JOIN'],
+    ['@@LEFTJOIN@@',  'LEFT JOIN'],
+    ['@@RIGHTJOIN@@', 'RIGHT JOIN'],
+    ['@@FULLJOIN@@',  'FULL JOIN'],
+    ['@@CROSSJOIN@@', 'CROSS JOIN'],
+    ['FROM',    'FROM'],
+    ['WHERE',   'WHERE'],
+    ['HAVING',  'HAVING'],
+    ['LIMIT',   'LIMIT'],
+    ['FETCH',   'FETCH'],
+    ['JOIN',    'JOIN'],
+  ];
+  {
+    let out = '', depth = 0, j = 0;
+    while (j < s.length) {
+      if (s[j] === '(') { depth++; out += s[j++]; continue; }
+      if (s[j] === ')') { depth--; out += s[j++]; continue; }
+      if (depth === 0) {
+        let hit = null;
+        for (const [tok, display] of CLAUSES) {
+          if (s.slice(j, j + tok.length).toUpperCase() === tok.toUpperCase()) {
+            if (!tok.startsWith('@@')) {
+              /* Verifica word boundary manual */
+              const bef = j > 0 ? s[j - 1] : ' ';
+              const aft = s[j + tok.length] ?? ' ';
+              if (/[A-Za-z_0-9]/.test(bef) || /[A-Za-z_0-9]/.test(aft)) continue;
+            }
+            hit = [tok, display]; break;
+          }
+        }
+        if (hit) {
+          const [tok, display] = hit;
+          if (out.length > 0) out += '\n';
+          out += display;
+          j += tok.length;
+          while (s[j] === ' ') j++;
+          continue;
+        }
+      }
+      out += s[j++];
+    }
+    s = out;
+  }
+
+  /* 4. Divide colunas do SELECT em linhas indentadas */
+  s = s.replace(/^SELECT ([\s\S]+?)(?=\nFROM|$)/im, (_, cols) => {
+    const c = cols.trim();
+    if (!c || c === '*') return 'SELECT *';
+    const items = splitArgs(c);
+    if (items.length <= 1) return `SELECT ${(items[0] ?? c).trim()}`;
+    return `SELECT\n${ind}${items.map(x => x.trim()).join(',\n' + ind)}`;
+  });
+
+  /* 5. Divide condições do WHERE em linhas indentadas */
+  s = s.replace(
+    /^WHERE ([\s\S]+?)(?=\nORDER BY|\nGROUP BY|\nHAVING|\nLIMIT|\nFETCH|\nINNER JOIN|\nLEFT JOIN|\nRIGHT JOIN|\nFULL JOIN|\nCROSS JOIN|\nJOIN|$)/im,
+    (_, cond) => {
+      const parts = splitConditions(cond.trim());
+      if (parts.length <= 1) return `WHERE ${cond.trim()}`;
+      const [first, ...rest] = parts;
+      return `WHERE ${first.trim()}\n${ind}${rest.map(p => p.trim()).join('\n' + ind)}`;
+    }
+  );
+
+  /* 6. Divide condições do HAVING em linhas indentadas */
+  s = s.replace(
+    /^HAVING ([\s\S]+?)(?=\nORDER BY|\nGROUP BY|\nLIMIT|\nFETCH|$)/im,
+    (_, cond) => {
+      const parts = splitConditions(cond.trim());
+      if (parts.length <= 1) return `HAVING ${cond.trim()}`;
+      const [first, ...rest] = parts;
+      return `HAVING ${first.trim()}\n${ind}${rest.map(p => p.trim()).join('\n' + ind)}`;
+    }
+  );
+
+  return restore(s.trim());
+}
+
 function applyFunctionConversions(sql) {
 
   /* ── Regra 6: ISNULL → IFNULL ── */
@@ -1711,7 +1876,9 @@ document.addEventListener('keydown', e => {
   }
   if (e.ctrlKey && e.shiftKey && e.key === 'F') {
     e.preventDefault();
-    document.getElementById('fmt-btn').click();
+    /* Formata o painel com foco: SQL se o input estiver ativo, HANA caso contrário */
+    if (document.activeElement === sqlInput) document.getElementById('fmt-btn').click();
+    else document.getElementById('fmt-hana-btn').click();
   }
   if (e.key === '?' && !inTextarea) {
     document.getElementById('sc-modal').classList.add('open');
