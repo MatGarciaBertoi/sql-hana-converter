@@ -1253,10 +1253,14 @@ function convertSubSelect(inner, ind) {
   const fr = cfg.uppercase ? 'FROM' : 'from';
   const on = cfg.uppercase ? 'ON'   : 'on';
 
+  /* Tabelas sempre recebem aspas duplas, mesmo com alias */
+  const t0q = cfg.quotes ? `"${t0}"` : t0;
+  const t1q = cfg.quotes ? `"${t1}"` : t1;
+
   return (
     `\n${s}${' '.repeat(cfg.indent)}SELECT ${selCol} ` +
-    `\n${s}${' '.repeat(cfg.indent)}${fr} ${t0} T0 ` +
-    `\n${s}${' '.repeat(cfg.indent)}${jt} ${t1} T1 ${on} ${onExpr}` +
+    `\n${s}${' '.repeat(cfg.indent)}${fr} ${t0q} T0 ` +
+    `\n${s}${' '.repeat(cfg.indent)}${jt} ${t1q} T1 ${on} ${onExpr}` +
     whereLines
   );
 }
@@ -1420,19 +1424,26 @@ function convertToHana(raw) {
 
 /* Reformata CASE WHEN com indentação limpa */
 function formatCaseWhen(sql) {
-  const ind = ' '.repeat(cfg.indent);
+  const ind  = ' '.repeat(cfg.indent);
+  const ind2 = ' '.repeat(cfg.indent * 2);
+  const kw   = w => cfg.uppercase ? w.toUpperCase() : w.toLowerCase();
+
   return sql
-    /* CASE → nova linha + indent */
-    .replace(/\bCASE\b/gi, m => cfg.uppercase ? '\n    CASE' : '\n    case')
-    /* WHEN → nova linha + indent duplo */
-    .replace(/\bWHEN\b/gi, m => `\n    ${ind}${cfg.uppercase ? 'WHEN' : 'when'}`)
-    /* THEN → espaço na mesma linha */
-    .replace(/\bTHEN\b/gi, m => `\n    ${ind}${ind}${cfg.uppercase ? 'THEN' : 'then'}`)
-    /* ELSE → nova linha */
-    .replace(/\bELSE\b/gi, m => `\n    ${ind}${ind}${cfg.uppercase ? 'ELSE' : 'else'}`)
-    /* END → nova linha */
-    .replace(/\bEND\b/gi,  m => `\n    ${cfg.uppercase ? 'END' : 'end'}`)
-    /* limpa linhas em branco duplas */
+    /* SELECT isolado no topo */
+    .replace(/^\s*SELECT\b/i, 'SELECT')
+    /* CASE → nova linha + 4 espaços */
+    .replace(/\bCASE\b/gi,    () => `\n    ${kw('CASE')}`)
+    /* WHEN → nova linha + 8 espaços */
+    .replace(/\bWHEN\b/gi,    () => `\n    ${ind}${kw('WHEN')}`)
+    /* AND que vem depois de ) de subquery → mesma linha do WHEN */
+    .replace(/\)\s*\n?\s*AND\b/gi, () => `)\n    ${ind}${kw('AND')}`)
+    /* THEN → nova linha + 12 espaços */
+    .replace(/\bTHEN\b/gi,    () => `\n    ${ind2}${kw('THEN')}`)
+    /* ELSE → nova linha + 12 espaços */
+    .replace(/\bELSE\b/gi,    () => `\n    ${ind2}${kw('ELSE')}`)
+    /* END → nova linha + 4 espaços */
+    .replace(/\bEND\b/gi,     () => `\n    ${kw('END')}`)
+    /* limpa espaços excessivos */
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
