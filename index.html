@@ -1054,14 +1054,31 @@ function toast(msg, type = 'info', ms = 2600) {
    CLIPBOARD
    ============================================================ */
 async function copyToClipboard(text, label) {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast(`${label} copiado para a área de transferência`, 'success');
-    return true;
-  } catch {
-    toast('Não foi possível copiar automaticamente. Selecione manualmente.', 'warning');
-    return false;
+  /* Método 1: Clipboard API moderna (HTTPS / contexto seguro) */
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`${label} copiado!`, 'success');
+      return true;
+    } catch { /* cai no método 2 */ }
   }
+
+  /* Método 2: execCommand — funciona em file://, HTTP e browsers antigos */
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length); /* garante seleção total no mobile */
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) { toast(`${label} copiado!`, 'success'); return true; }
+  } catch { /* cai no erro final */ }
+
+  toast('Não foi possível copiar automaticamente — selecione o texto manualmente.', 'warning', 4000);
+  return false;
 }
 
 function flashBtn(btn, icon, label) {
