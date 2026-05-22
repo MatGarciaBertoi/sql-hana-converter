@@ -1383,8 +1383,9 @@ function quoteExpr(expr) {
   const [safe2, restore2] = protectLiterals(r);
   let r2 = safe2;
 
-  /* ── Passe 4: identif. isolados — agora "Col" e @@tokens@@ já estão opacos ── */
-  r2 = r2.replace(/\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
+  /* ── Passe 4: identif. isolados — agora "Col" e @@tokens@@ já estão opacos ──
+     (?<![@"]) impede que DQ5 dentro de @@DQ5@@ seja re-citado como "DQ5"        */
+  r2 = r2.replace(/(?<![@"])\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
 
   /* ── Passe 5: restaura na ordem inversa ── */
   return restore1(restore2(r2));
@@ -1464,6 +1465,48 @@ function convertSimpleQuery(sql) {
   );
 
   return sql;
+}
+
+/* ============================================================
+   QUOTING PARA ROTA COMPLEXA (JOIN / CASE WHEN / subselects)
+   ============================================================ */
+function applyHanaQuoting(sql) {
+  /* 0. AS 'alias' → AS "alias" */
+  sql = sql.replace(/\bAS\s+'([^']+)'/gi, (_, a) => `AS "${a}"`);
+
+  const [safe, restore] = protectLiterals(sql);
+  let s = safe;
+
+  const NONALIAS_RE = /^(WHERE|GROUP|ORDER|HAVING|LIMIT|FETCH|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|ON|SET|AND|OR|WHEN|THEN|ELSE|END|SELECT|FROM|BY|DESC|ASC)$/i;
+
+  /* 1. FROM tableName [alias] → FROM "tableName" alias */
+  s = s.replace(
+    /\bFROM\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\b/gi,
+    (_, tbl, alias) => {
+      if (SQL_KWSET.has(tbl.toUpperCase())) return alias ? `FROM ${tbl} ${alias}` : `FROM ${tbl}`;
+      const tblQ = `"${tbl}"`;
+      if (alias && !NONALIAS_RE.test(alias)) return `FROM ${tblQ} ${alias}`;
+      return `FROM ${tblQ}`;
+    }
+  );
+
+  /* 2. JOINs → JOIN "tableName" alias */
+  s = s.replace(
+    /\b(INNER\s+JOIN|LEFT\s+(?:OUTER\s+)?JOIN|RIGHT\s+(?:OUTER\s+)?JOIN|FULL\s+(?:OUTER\s+)?JOIN|CROSS\s+JOIN|JOIN)\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\b/gi,
+    (_, jtype, tbl, alias) => {
+      if (SQL_KWSET.has(tbl.toUpperCase())) return alias ? `${jtype} ${tbl} ${alias}` : `${jtype} ${tbl}`;
+      const tblQ = `"${tbl}"`;
+      if (alias && !NONALIAS_RE.test(alias)) return `${jtype} ${tblQ} ${alias}`;
+      return `${jtype} ${tblQ}`;
+    }
+  );
+
+  /* 3. alias.Campo → alias."Campo" (ON, WHERE, SELECT, subqueries…) */
+  s = s.replace(/\b(\w+)\.([A-Za-z_]\w*)\b(?!\s*\()/g, (_, alias, col) =>
+    SQL_KWSET.has(col.toUpperCase()) ? `${alias}.${col}` : `${alias}."${col}"`
+  );
+
+  return restore(s);
 }
 
 /* ============================================================
@@ -1778,6 +1821,9 @@ function convertToHana(raw) {
 
   /* Reformata CASE WHEN */
   sql = formatCaseWhen(sql);
+
+  /* Aplica aspas duplas HANA na rota complexa */
+  if (cfg.quotes) sql = applyHanaQuoting(sql);
 
   /* FROM DUMMY */
   if (cfg.dummy && !hasToplevelFrom) {
