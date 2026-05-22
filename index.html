@@ -1571,7 +1571,9 @@ function formatSQL(sql) {
           if (out.length > 0) out += '\n';
           out += display;
           j += tok.length;
-          while (s[j] === ' ') j++;
+          /* NÃO pular o espaço após a keyword — ele é o separador obrigatório
+             entre a cláusula e o conteúdo seguinte (ex: FROM "OINV", LIMIT 5).
+             Removê-lo causaria FROM"OINV", LIMIT5, WHERET0... — sintaxe inválida. */
           continue;
         }
       }
