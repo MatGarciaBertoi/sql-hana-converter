@@ -1261,6 +1261,107 @@ function convertSubSelect(inner, ind) {
   );
 }
 
+/* ============================================================
+   SIMPLE QUERY ENGINE
+   ============================================================ */
+
+/* Palavras reservadas que NUNCA recebem aspas */
+const SQL_KWSET = new Set([
+  'SELECT','FROM','WHERE','AND','OR','NOT','IN','BETWEEN','LIKE','IS','NULL',
+  'TRUE','FALSE','EXISTS','CASE','WHEN','THEN','ELSE','END','AS','BY',
+  'GROUP','ORDER','HAVING','DISTINCT','ALL','ANY','UNION','EXCEPT','INTERSECT',
+  'JOIN','INNER','LEFT','RIGHT','FULL','CROSS','ON','TOP','LIMIT','FETCH',
+  'NEXT','ONLY','OFFSET','ROWS','INSERT','UPDATE','DELETE','SET','INTO',
+  'VALUES','WITH','OVER','PARTITION','RANGE','ASC','DESC','DUMMY','BETWEEN',
+  'COUNT','SUM','AVG','MIN','MAX','COALESCE','ISNULL','IFNULL','NVL',
+  'GETDATE','NOW','DATEADD','DATEDIFF','YEAR','MONTH','DAY','CONVERT','CAST',
+  'LEN','LENGTH','SUBSTRING','TRIM','UPPER','LOWER','REPLACE','CHARINDEX',
+  'LOCATE','CONCAT','ISNUMERIC','ISDATE','ROW_NUMBER','RANK','DENSE_RANK',
+]);
+
+/* Coloca aspas em um identificador se necessário */
+function quoteWord(w) {
+  if (/^"/.test(w))                   return w;   // já tem aspas
+  if (/^\d/.test(w))                   return w;   // número
+  if (SQL_KWSET.has(w.toUpperCase()))  return w;   // keyword
+  return `"${w}"`;
+}
+
+/* Protege literais e SAP B1 fields, cita identificadores, restaura */
+function quoteExpr(expr) {
+  const saps = [], strs = [];
+
+  /* Protege $[$...] */
+  expr = expr.replace(/\$\[\$[^\]]+\]/g, m => {
+    saps.push(m); return `\x00SAP${saps.length - 1}\x00`;
+  });
+  /* Protege string literals 'valor' */
+  expr = expr.replace(/'[^']*'/g, m => {
+    strs.push(m); return `\x00STR${strs.length - 1}\x00`;
+  });
+
+  /* Cita identificadores que NÃO são seguidos de ( (funções) */
+  expr = expr.replace(/\b([A-Za-z_]\w*)\b(?!\s*\()/g, m => quoteWord(m));
+
+  /* Restaura */
+  expr = expr.replace(/\x00STR(\d+)\x00/g, (_, i) => strs[i]);
+  expr = expr.replace(/\x00SAP(\d+)\x00/g, (_, i) => saps[i]);
+
+  return expr;
+}
+
+/* Converte query simples: sem JOINs, sem CASE WHEN, sem subselects */
+function convertSimpleQuery(sql) {
+  /* 1. Cita tabela no FROM (sem alias, sem JOIN) */
+  sql = sql.replace(
+    /\bFROM\s+([A-Za-z_]\w*)\b(?!\s*\.)/gi,
+    (_, tbl) => SQL_KWSET.has(tbl.toUpperCase()) ? `FROM ${tbl}` : `FROM "${tbl}"`
+  );
+
+  /* 2. Cita colunas no SELECT (preserva *) */
+  sql = sql.replace(
+    /\bSELECT\b([\s\S]+?)\bFROM\b/gi,
+    (m, cols) => {
+      if (cols.trim() === '*') return m;
+      /* Cita cada coluna separadamente (respeita alias AS) */
+      const quoted = cols.split(',').map(col => {
+        const asParts = col.split(/\bAS\b/i);
+        if (asParts.length === 2) {
+          return quoteExpr(asParts[0]) + ' AS' + quoteExpr(asParts[1]);
+        }
+        return quoteExpr(col);
+      }).join(',');
+      return `SELECT${quoted}FROM`;
+    }
+  );
+
+  /* 3. Cita identificadores no WHERE */
+  sql = sql.replace(
+    /\bWHERE\b([\s\S]+?)(?=\s*(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|\bFETCH\b|$))/gi,
+    (_, cond) => `WHERE ${quoteExpr(cond.trim())}`
+  );
+
+  /* 4. Cita identificadores no ORDER BY */
+  sql = sql.replace(
+    /\bORDER\s+BY\b([\s\S]+?)(?=\s*(?:\bLIMIT\b|\bFETCH\b|$))/gi,
+    (_, cols) => `ORDER BY ${quoteExpr(cols.trim())}`
+  );
+
+  /* 5. Cita identificadores no GROUP BY */
+  sql = sql.replace(
+    /\bGROUP\s+BY\b([\s\S]+?)(?=\s*(?:\bHAVING\b|\bORDER\b|\bLIMIT\b|$))/gi,
+    (_, cols) => `GROUP BY ${quoteExpr(cols.trim())}`
+  );
+
+  /* 6. Cita identificadores no HAVING */
+  sql = sql.replace(
+    /\bHAVING\b([\s\S]+?)(?=\s*(?:\bORDER\b|\bLIMIT\b|$))/gi,
+    (_, cond) => `HAVING ${quoteExpr(cond.trim())}`
+  );
+
+  return sql;
+}
+
 /* ── Engine principal ── */
 function convertToHana(raw) {
   getCfg();
@@ -1273,19 +1374,31 @@ function convertToHana(raw) {
   /* 2. Keywords uppercase */
   if (cfg.uppercase) sql = upKeywords(sql);
 
-  /* 3. Detecta se é um SELECT puro (sem FROM na query principal)
-        → precisa de FROM DUMMY */
+  /* 3. Detecta tipo de query */
+  const hasJoin    = /\b(INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|(?<!\w)JOIN\b)/i.test(sql);
+  const hasCaseW   = /\bCASE\b/i.test(sql);
+  const hasSubSel  = /\bIN\s*\(\s*SELECT\b/i.test(sql);
+  const isSimple   = !hasJoin && !hasCaseW && !hasSubSel;
+
+  /* 3a. Rota SIMPLES: sem JOIN, sem CASE, sem subselect */
+  if (isSimple) {
+    if (cfg.quotes) sql = convertSimpleQuery(sql);
+    return sql.trim();
+  }
+
+  /* 3b. Rota COMPLEXA: lógica existente */
+
+  /* Detecta se precisa de FROM DUMMY */
   const hasToplevelFrom = /^\s*SELECT\b[\s\S]+?\bFROM\b(?!\s*DUMMY)/im.test(sql) &&
                           !/^\s*SELECT\s*\n?\s*CASE/i.test(sql);
 
-  /* 4. Converte subselects dentro de IN(...) */
+  /* Converte subselects dentro de IN(...) */
   sql = sql.replace(
     /\bIN\s*\(\s*(SELECT\s+[\s\S]+?)\)/gi,
     (match, inner) => {
-      /* Calcula indentação base pelo contexto */
-      const lineStart = sql.slice(0, sql.indexOf(match)).split('\n').pop();
+      const lineStart  = sql.slice(0, sql.indexOf(match)).split('\n').pop();
       const baseIndent = lineStart.replace(/\S[\s\S]*/, '');
-      const converted = convertSubSelect(
+      const converted  = convertSubSelect(
         cfg.uppercase ? upKeywords(inner.trim()) : inner.trim(),
         baseIndent + ' '.repeat(cfg.indent)
       );
@@ -1293,10 +1406,10 @@ function convertToHana(raw) {
     }
   );
 
-  /* 5. Reformata bloco CASE WHEN principal */
+  /* Reformata CASE WHEN */
   sql = formatCaseWhen(sql);
 
-  /* 6. FROM DUMMY */
+  /* FROM DUMMY */
   if (cfg.dummy && !hasToplevelFrom) {
     sql = sql.trimEnd();
     if (!/FROM\s+DUMMY\s*$/i.test(sql)) sql += '\nFROM DUMMY';
