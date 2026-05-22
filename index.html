@@ -1398,14 +1398,15 @@ function convertSimpleQuery(sql) {
   sql = sql.replace(/\bAS\s+'([^']+)'/gi, (_, a) => `AS "${a}"`);
 
   /* 2. FROM tabela [alias] → FROM "tabela" alias
-        Exclui palavras-reservadas como alias para não engolir WHERE/JOIN etc. */
-  const CLAUSE_KW = /^(WHERE|GROUP|ORDER|HAVING|LIMIT|FETCH|INNER|LEFT|RIGHT|FULL|CROSS|JOIN)$/i;
+        Lookahead negativo impede que WHERE/GROUP/ORDER/etc. sejam capturados
+        como alias — evitando que a palavra-reservada suma da string final.    */
+  const KW_LA = '(?:WHERE|GROUP|ORDER|HAVING|LIMIT|FETCH|NEXT|OFFSET|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|ON|AND|OR|BY|SET|DESC|ASC)';
   sql = sql.replace(
-    /\bFROM\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\b/gi,
+    new RegExp(`\\bFROM\\s+([A-Za-z_]\\w*)(?:\\s+(?!${KW_LA}\\b)([A-Za-z_]\\w*))?\\b`, 'gi'),
     (_, tbl, alias) => {
       if (SQL_KWSET.has(tbl.toUpperCase())) return alias ? `FROM ${tbl} ${alias}` : `FROM ${tbl}`;
       const tblQ = `"${tbl}"`;
-      if (alias && !CLAUSE_KW.test(alias)) return `FROM ${tblQ} ${alias}`;
+      if (alias) return `FROM ${tblQ} ${alias}`;
       return `FROM ${tblQ}`;
     }
   );
@@ -1477,26 +1478,28 @@ function applyHanaQuoting(sql) {
   const [safe, restore] = protectLiterals(sql);
   let s = safe;
 
-  const NONALIAS_RE = /^(WHERE|GROUP|ORDER|HAVING|LIMIT|FETCH|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|ON|SET|AND|OR|WHEN|THEN|ELSE|END|SELECT|FROM|BY|DESC|ASC)$/i;
+  /* Lookahead negativo: impede que palavras-reservadas sejam capturadas como alias,
+     o que causaria seu desaparecimento da string quando a substituição as omitia. */
+  const KW_LA = '(?:WHERE|GROUP|ORDER|HAVING|LIMIT|FETCH|NEXT|OFFSET|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|ON|SET|AND|OR|WHEN|THEN|ELSE|END|SELECT|FROM|BY|DESC|ASC)';
 
   /* 1. FROM tableName [alias] → FROM "tableName" alias */
   s = s.replace(
-    /\bFROM\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\b/gi,
+    new RegExp(`\\bFROM\\s+([A-Za-z_]\\w*)(?:\\s+(?!${KW_LA}\\b)([A-Za-z_]\\w*))?\\b`, 'gi'),
     (_, tbl, alias) => {
       if (SQL_KWSET.has(tbl.toUpperCase())) return alias ? `FROM ${tbl} ${alias}` : `FROM ${tbl}`;
       const tblQ = `"${tbl}"`;
-      if (alias && !NONALIAS_RE.test(alias)) return `FROM ${tblQ} ${alias}`;
+      if (alias) return `FROM ${tblQ} ${alias}`;
       return `FROM ${tblQ}`;
     }
   );
 
   /* 2. JOINs → JOIN "tableName" alias */
   s = s.replace(
-    /\b(INNER\s+JOIN|LEFT\s+(?:OUTER\s+)?JOIN|RIGHT\s+(?:OUTER\s+)?JOIN|FULL\s+(?:OUTER\s+)?JOIN|CROSS\s+JOIN|JOIN)\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\b/gi,
+    new RegExp(`\\b(INNER\\s+JOIN|LEFT\\s+(?:OUTER\\s+)?JOIN|RIGHT\\s+(?:OUTER\\s+)?JOIN|FULL\\s+(?:OUTER\\s+)?JOIN|CROSS\\s+JOIN|JOIN)\\s+([A-Za-z_]\\w*)(?:\\s+(?!${KW_LA}\\b)([A-Za-z_]\\w*))?\\b`, 'gi'),
     (_, jtype, tbl, alias) => {
       if (SQL_KWSET.has(tbl.toUpperCase())) return alias ? `${jtype} ${tbl} ${alias}` : `${jtype} ${tbl}`;
       const tblQ = `"${tbl}"`;
-      if (alias && !NONALIAS_RE.test(alias)) return `${jtype} ${tblQ} ${alias}`;
+      if (alias) return `${jtype} ${tblQ} ${alias}`;
       return `${jtype} ${tblQ}`;
     }
   );
