@@ -1346,8 +1346,12 @@ function quoteExpr(expr) {
     SQL_KWSET.has(col.toUpperCase()) ? `${alias}.${col}` : `${alias}."${col}"`
   );
 
-  /* Identificadores isolados (não seguidos de ( ou .) */
-  r = r.replace(/\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
+  /* Identificadores isolados — EXCLUI:
+     · palavras precedidas por " → já dentro de "Col" gerado pela regra acima
+     · palavras precedidas por @ → dentro de placeholder @@STR0@@ / @@DQ0@@
+     Sem esse lookbehind, "DocEntry" virava ""DocEntry"" e @@STR0@@ virava @@"STR0"@@
+     (corrompendo a chave do mapa e impedindo o restore dos literais). */
+  r = r.replace(/(?<![@"])\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
 
   return restore(r);
 }
