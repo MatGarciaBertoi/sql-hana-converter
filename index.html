@@ -1277,10 +1277,16 @@ const SQL_KWSET = new Set([
   'JOIN','INNER','LEFT','RIGHT','FULL','CROSS','ON','TOP','LIMIT','FETCH',
   'NEXT','ONLY','OFFSET','ROWS','INSERT','UPDATE','DELETE','SET','INTO',
   'VALUES','WITH','OVER','PARTITION','RANGE','ASC','DESC','DUMMY','BETWEEN',
+  /* funções SQL Server (serão convertidas) */
   'COUNT','SUM','AVG','MIN','MAX','COALESCE','ISNULL','IFNULL','NVL',
   'GETDATE','NOW','DATEADD','DATEDIFF','YEAR','MONTH','DAY','CONVERT','CAST',
   'LEN','LENGTH','SUBSTRING','TRIM','UPPER','LOWER','REPLACE','CHARINDEX',
   'LOCATE','CONCAT','ISNUMERIC','ISDATE','ROW_NUMBER','RANK','DENSE_RANK',
+  /* constantes/funções HANA que não levam () */
+  'CURRENT_DATE','CURRENT_TIMESTAMP','CURRENT_TIME',
+  /* funções HANA geradas pela conversão */
+  'DAYS_BETWEEN','ADD_DAYS','EXTRACT','TO_VARCHAR','TO_NVARCHAR','IFNULL',
+  'LENGTH','LOCATE',
 ]);
 
 /* Coloca aspas em um identificador se necessário */
@@ -1366,6 +1372,116 @@ function convertSimpleQuery(sql) {
   return sql;
 }
 
+/* ============================================================
+   FUNCTION CONVERSION RULES 5–12
+   ============================================================ */
+
+/* Divide os argumentos de uma função respeitando parênteses aninhados */
+function splitArgs(str) {
+  const args = []; let depth = 0, cur = '';
+  for (const c of str) {
+    if (c === '(') depth++;
+    if (c === ')') depth--;
+    if (c === ',' && depth === 0) { args.push(cur.trim()); cur = ''; }
+    else cur += c;
+  }
+  if (cur.trim()) args.push(cur.trim());
+  return args;
+}
+
+function applyFunctionConversions(sql) {
+
+  /* ── Regra 6: ISNULL → IFNULL ── */
+  sql = sql.replace(/\bISNULL\s*\(/gi, 'IFNULL(');
+
+  /* ── Regra 7: GETDATE() → CURRENT_DATE ── */
+  sql = sql.replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_DATE');
+
+  /* ── Regra 8: DATEDIFF(unit, d1, d2) → DAYS_BETWEEN(d1, d2) ── */
+  sql = sql.replace(/\bDATEDIFF\s*\(([^()]+)\)/gi, (_, args) => {
+    const p = splitArgs(args);
+    if (p.length >= 3) return `DAYS_BETWEEN(${p[1]}, ${p[2]})`;
+    return `DAYS_BETWEEN(${p.slice(1).join(', ')})`;
+  });
+
+  /* ── Regra 8: DATEADD(unit, n, date) → ADD_DAYS(date, n) ── */
+  sql = sql.replace(/\bDATEADD\s*\(([^()]+)\)/gi, (_, args) => {
+    const p = splitArgs(args);
+    if (p.length >= 3) return `ADD_DAYS(${p[2]}, ${p[1]})`;
+    return `ADD_DAYS(${p.slice(1).join(', ')})`;
+  });
+
+  /* ── Regra 9: LEN → LENGTH ── */
+  sql = sql.replace(/\bLEN\s*\(/gi, 'LENGTH(');
+
+  /* ── Regra 9: CHARINDEX(needle, haystack) → LOCATE(haystack, needle) ── */
+  sql = sql.replace(/\bCHARINDEX\s*\(([^()]+)\)/gi, (_, args) => {
+    const p = splitArgs(args);
+    if (p.length >= 2) return `LOCATE(${p[1]}, ${p[0]})`;
+    return `LOCATE(${args})`;
+  });
+
+  /* ── Regra 11: CONVERT(VARCHAR, field, 103) → TO_VARCHAR(field, 'DD/MM/YYYY') ── */
+  sql = sql.replace(/\bCONVERT\s*\(([^()]+)\)/gi, (_, args) => {
+    const p = splitArgs(args);
+    if (p.length >= 3) {
+      const style = p[2].trim();
+      const field = p[1].trim();
+      const type  = p[0].trim().toUpperCase();
+      if (style === '103') return `TO_VARCHAR(${field}, 'DD/MM/YYYY')`;
+      if (style === '112') return `TO_VARCHAR(${field}, 'YYYYMMDD')`;
+      if (style === '120') return `TO_VARCHAR(${field}, 'YYYY-MM-DD HH24:MI:SS')`;
+      if (type.startsWith('NVARCHAR')) return `TO_NVARCHAR(${field})`;
+      if (type.startsWith('VARCHAR') || type.startsWith('CHAR')) return `TO_VARCHAR(${field})`;
+    }
+    if (p.length === 2) {
+      const type = p[0].trim().toUpperCase();
+      if (type.startsWith('NVARCHAR')) return `TO_NVARCHAR(${p[1]})`;
+      if (type.startsWith('VARCHAR'))  return `TO_VARCHAR(${p[1]})`;
+    }
+    return `CONVERT(${args})`; /* não reconhecido — mantém */
+  });
+
+  /* ── Regra 11: CAST(expr AS NVARCHAR/VARCHAR) → TO_NVARCHAR / TO_VARCHAR ── */
+  sql = sql.replace(
+    /\bCAST\s*\(\s*([\s\S]+?)\s+AS\s+(N?VARCHAR(?:\s*\(\d+\))?|NVARCHAR|VARCHAR)\s*\)/gi,
+    (_, expr, type) => type.toUpperCase().startsWith('N')
+      ? `TO_NVARCHAR(${expr.trim()})`
+      : `TO_VARCHAR(${expr.trim()})`
+  );
+
+  /* ── Regra 12: YEAR/MONTH/DAY(expr) → EXTRACT(UNIT FROM expr) ── */
+  for (const fn of ['YEAR','MONTH','DAY']) {
+    sql = sql.replace(
+      new RegExp(`\\b${fn}\\s*\\(([^()]+)\\)`, 'gi'),
+      (_, expr) => `EXTRACT(${fn} FROM ${expr.trim()})`
+    );
+  }
+
+  /* ── Regra 5: Concatenação + → || (quando adjacente a string literal) ── */
+  const concatRe = /('[^']*'|[\w."$\[\]]+)\s*\+\s*('[^']*'|[\w."$\[\]]+)/g;
+  for (let i = 0; i < 5; i++) {          /* repete para capturar cadeias longas */
+    const next = sql.replace(concatRe, (m, a, b) =>
+      (a.startsWith("'") || b.startsWith("'")) ? `${a} || ${b}` : m
+    );
+    if (next === sql) break;
+    sql = next;
+  }
+
+  return sql;
+}
+
+/* ── Regra 10: SELECT TOP N → SELECT ... LIMIT N ── */
+function convertTopToLimit(sql) {
+  const m = sql.match(/\bSELECT\s+TOP\s+(\d+)\b/i);
+  if (!m) return sql;
+  const n = m[1];
+  sql = sql.replace(/\bSELECT\s+TOP\s+\d+\b/i, 'SELECT');
+  sql = sql.trimEnd().replace(/\s*;?\s*$/, '');
+  if (!/\bLIMIT\s+\d+\s*$/i.test(sql)) sql += `\nLIMIT ${n}`;
+  return sql;
+}
+
 /* ── Engine principal ── */
 function convertToHana(raw) {
   getCfg();
@@ -1375,10 +1491,16 @@ function convertToHana(raw) {
   /* 1. SAP B1 field refs */
   if (cfg.sapfields) sql = fixSapFields(sql);
 
-  /* 2. Keywords uppercase */
+  /* 2. Conversões de funções (regras 5–12) */
+  sql = applyFunctionConversions(sql);
+
+  /* 3. TOP N → LIMIT N (regra 10) */
+  sql = convertTopToLimit(sql);
+
+  /* 4. Keywords uppercase */
   if (cfg.uppercase) sql = upKeywords(sql);
 
-  /* 3. Detecta tipo de query */
+  /* 5. Detecta tipo de query */
   const hasJoin    = /\b(INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|(?<!\w)JOIN\b)/i.test(sql);
   const hasCaseW   = /\bCASE\b/i.test(sql);
   const hasSubSel  = /\bIN\s*\(\s*SELECT\b/i.test(sql);
