@@ -1336,46 +1336,58 @@ function quoteWord(w) {
   return `"${w}"`;
 }
 
-/* ── Proteção de literais com placeholders seguros (sem null bytes) ── */
+/* ── Contador global — garante chaves únicas entre chamadas aninhadas ──
+   Sem isso, duas chamadas independentes a protectLiterals() começam em c=0
+   e produzem @@DQ0@@, @@STR0@@ etc. idênticos — o restore() da segunda
+   chamada sobrescreve os tokens da primeira, corrompendo a saída.         */
+let _litSeq = 0;
+
 function protectLiterals(text) {
   const map = {};
-  let c = 0;
 
   /* Protege $[$...] SAP B1 */
   text = text.replace(/\$\[\$[^\]]+\]/g, m => {
-    const k = `@@SAP${c++}@@`; map[k] = m; return k;
+    const k = `@@SAP${_litSeq++}@@`; map[k] = m; return k;
   });
   /* Protege identificadores já com aspas duplas */
   text = text.replace(/"[^"]+"/g, m => {
-    const k = `@@DQ${c++}@@`; map[k] = m; return k;
+    const k = `@@DQ${_litSeq++}@@`; map[k] = m; return k;
   });
   /* Protege string literals 'valor' */
   text = text.replace(/'[^']*'/g, m => {
-    const k = `@@STR${c++}@@`; map[k] = m; return k;
+    const k = `@@STR${_litSeq++}@@`; map[k] = m; return k;
   });
 
   const restore = t => t.replace(/@@(?:SAP|DQ|STR)\d+@@/g, k => map[k] ?? k);
   return [text, restore];
 }
 
-/* Cita expr respeitando alias.coluna → alias."coluna" */
+/* Cita expr respeitando alias.coluna → alias."coluna"
+   Estratégia em 2 passes para evitar double-quoting e tokens corrompidos:
+   1. Protege literais existentes ("..." e '...') → @@DQn@@, @@STRn@@
+   2. Converte alias.Coluna → alias."Coluna"
+   3. Protege os "Coluna" recém-adicionados → novos @@DQm@@ (chaves únicas graças ao _litSeq global)
+   4. Cita identificadores isolados (nunca tocará "Col" já protegidos)
+   5. Restaura pass 2, depois pass 1                                        */
 function quoteExpr(expr) {
-  const [safe, restore] = protectLiterals(expr);
-  let r = safe;
+  /* ── Passe 1: protege literais originais ── */
+  const [safe1, restore1] = protectLiterals(expr);
+  let r = safe1;
 
-  /* alias.Coluna → alias."Coluna" (alias NÃO é citado) */
+  /* ── Passe 2: alias.Coluna → alias."Coluna" ── */
   r = r.replace(/\b(\w+)\.([A-Za-z_]\w*)\b(?!\s*\()/g, (_, alias, col) =>
     SQL_KWSET.has(col.toUpperCase()) ? `${alias}.${col}` : `${alias}."${col}"`
   );
 
-  /* Identificadores isolados — EXCLUI:
-     · palavras precedidas por " → já dentro de "Col" gerado pela regra acima
-     · palavras precedidas por @ → dentro de placeholder @@STR0@@ / @@DQ0@@
-     Sem esse lookbehind, "DocEntry" virava ""DocEntry"" e @@STR0@@ virava @@"STR0"@@
-     (corrompendo a chave do mapa e impedindo o restore dos literais). */
-  r = r.replace(/(?<![@"])\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
+  /* ── Passe 3: protege "Coluna" recém-adicionados (chaves únicas garantidas) ── */
+  const [safe2, restore2] = protectLiterals(r);
+  let r2 = safe2;
 
-  return restore(r);
+  /* ── Passe 4: identif. isolados — agora "Col" e @@tokens@@ já estão opacos ── */
+  r2 = r2.replace(/\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
+
+  /* ── Passe 5: restaura na ordem inversa ── */
+  return restore1(restore2(r2));
 }
 
 /* Converte query simples: sem JOINs, sem CASE WHEN, sem subselects */
