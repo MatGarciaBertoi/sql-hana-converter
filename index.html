@@ -1310,77 +1310,116 @@ const SQL_KWSET = new Set([
 function quoteWord(w) {
   if (/^"/.test(w))                   return w;   // já tem aspas
   if (/^\d/.test(w))                   return w;   // número
-  if (SQL_KWSET.has(w.toUpperCase()))  return w;   // keyword
+  if (SQL_KWSET.has(w.toUpperCase()))  return w;   // keyword reservada
   return `"${w}"`;
 }
 
-/* Protege literais e SAP B1 fields, cita identificadores, restaura */
-function quoteExpr(expr) {
-  const saps = [], strs = [];
+/* ── Proteção de literais com placeholders seguros (sem null bytes) ── */
+function protectLiterals(text) {
+  const map = {};
+  let c = 0;
 
-  /* Protege $[$...] */
-  expr = expr.replace(/\$\[\$[^\]]+\]/g, m => {
-    saps.push(m); return `\x00SAP${saps.length - 1}\x00`;
+  /* Protege $[$...] SAP B1 */
+  text = text.replace(/\$\[\$[^\]]+\]/g, m => {
+    const k = `@@SAP${c++}@@`; map[k] = m; return k;
+  });
+  /* Protege identificadores já com aspas duplas */
+  text = text.replace(/"[^"]+"/g, m => {
+    const k = `@@DQ${c++}@@`; map[k] = m; return k;
   });
   /* Protege string literals 'valor' */
-  expr = expr.replace(/'[^']*'/g, m => {
-    strs.push(m); return `\x00STR${strs.length - 1}\x00`;
+  text = text.replace(/'[^']*'/g, m => {
+    const k = `@@STR${c++}@@`; map[k] = m; return k;
   });
 
-  /* Cita identificadores que NÃO são seguidos de ( (funções) */
-  expr = expr.replace(/\b([A-Za-z_]\w*)\b(?!\s*\()/g, m => quoteWord(m));
+  const restore = t => t.replace(/@@(?:SAP|DQ|STR)\d+@@/g, k => map[k] ?? k);
+  return [text, restore];
+}
 
-  /* Restaura */
-  expr = expr.replace(/\x00STR(\d+)\x00/g, (_, i) => strs[i]);
-  expr = expr.replace(/\x00SAP(\d+)\x00/g, (_, i) => saps[i]);
+/* Cita expr respeitando alias.coluna → alias."coluna" */
+function quoteExpr(expr) {
+  const [safe, restore] = protectLiterals(expr);
+  let r = safe;
 
-  return expr;
+  /* alias.Coluna → alias."Coluna" (alias NÃO é citado) */
+  r = r.replace(/\b(\w+)\.([A-Za-z_]\w*)\b(?!\s*\()/g, (_, alias, col) =>
+    SQL_KWSET.has(col.toUpperCase()) ? `${alias}.${col}` : `${alias}."${col}"`
+  );
+
+  /* Identificadores isolados (não seguidos de ( ou .) */
+  r = r.replace(/\b([A-Za-z_]\w*)\b(?!\s*[.(])/g, m => quoteWord(m));
+
+  return restore(r);
 }
 
 /* Converte query simples: sem JOINs, sem CASE WHEN, sem subselects */
 function convertSimpleQuery(sql) {
-  /* 1. Cita tabela no FROM (sem alias, sem JOIN) */
-  sql = sql.replace(
-    /\bFROM\s+([A-Za-z_]\w*)\b(?!\s*\.)/gi,
-    (_, tbl) => SQL_KWSET.has(tbl.toUpperCase()) ? `FROM ${tbl}` : `FROM "${tbl}"`
-  );
 
-  /* 2. Cita colunas no SELECT (preserva *) */
+  /* 1. AS 'alias' → AS "alias" (aspas simples de alias → duplas) */
+  sql = sql.replace(/\bAS\s+'([^']+)'/gi, (_, a) => `AS "${a}"`);
+
+  /* 2. FROM tabela [alias] → FROM "tabela" alias
+        Exclui palavras-reservadas como alias para não engolir WHERE/JOIN etc. */
+  const CLAUSE_KW = /^(WHERE|GROUP|ORDER|HAVING|LIMIT|FETCH|INNER|LEFT|RIGHT|FULL|CROSS|JOIN)$/i;
   sql = sql.replace(
-    /\bSELECT\b([\s\S]+?)\bFROM\b/gi,
-    (m, cols) => {
-      if (cols.trim() === '*') return m;
-      /* Cita cada coluna separadamente (respeita alias AS) */
-      const quoted = cols.split(',').map(col => {
-        const asParts = col.split(/\bAS\b/i);
-        if (asParts.length === 2) {
-          return quoteExpr(asParts[0]) + ' AS' + quoteExpr(asParts[1]);
-        }
-        return quoteExpr(col);
-      }).join(',');
-      return `SELECT${quoted}FROM`;
+    /\bFROM\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\b/gi,
+    (_, tbl, alias) => {
+      if (SQL_KWSET.has(tbl.toUpperCase())) return alias ? `FROM ${tbl} ${alias}` : `FROM ${tbl}`;
+      const tblQ = `"${tbl}"`;
+      if (alias && !CLAUSE_KW.test(alias)) return `FROM ${tblQ} ${alias}`;
+      return `FROM ${tblQ}`;
     }
   );
 
-  /* 3. Cita identificadores no WHERE */
+  /* 3. SELECT colunas FROM — cita cada item respeitando funções e vírgulas aninhadas */
+  sql = sql.replace(
+    /\bSELECT\b([\s\S]+?)\bFROM\b/gi,
+    (_, cols) => {
+      if (cols.trim() === '*') return `SELECT * FROM`;
+      const items = splitArgs(cols);   /* splitArgs respeita parênteses aninhados */
+      const quoted = items.map(item => {
+        item = item.trim();
+        /* Localiza AS no nível 0 (fora de parênteses) */
+        let asPos = -1, depth = 0;
+        for (let i = 0; i < item.length - 1; i++) {
+          if (item[i] === '(') depth++;
+          else if (item[i] === ')') depth--;
+          else if (depth === 0 && /\bAS\b/i.test(item.slice(i, i + 2)) &&
+                   (i === 0 || /\W/.test(item[i-1])) &&
+                   /\W/.test(item[i+2] || ' ')) {
+            asPos = i; break;
+          }
+        }
+        if (asPos > -1) {
+          const exprPart  = item.slice(0, asPos).trim();
+          const aliasPart = item.slice(asPos + 2).trim();
+          return `${quoteExpr(exprPart)} AS ${aliasPart}`;
+        }
+        return quoteExpr(item);
+      });
+      return `SELECT ${quoted.join(', ')} FROM`;
+    }
+  );
+
+  /* 4. WHERE */
   sql = sql.replace(
     /\bWHERE\b([\s\S]+?)(?=\s*(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|\bFETCH\b|$))/gi,
     (_, cond) => `WHERE ${quoteExpr(cond.trim())}`
   );
 
-  /* 4. Cita identificadores no ORDER BY */
+  /* 5. ORDER BY */
   sql = sql.replace(
     /\bORDER\s+BY\b([\s\S]+?)(?=\s*(?:\bLIMIT\b|\bFETCH\b|$))/gi,
     (_, cols) => `ORDER BY ${quoteExpr(cols.trim())}`
   );
 
-  /* 5. Cita identificadores no GROUP BY */
+  /* 6. GROUP BY */
   sql = sql.replace(
     /\bGROUP\s+BY\b([\s\S]+?)(?=\s*(?:\bHAVING\b|\bORDER\b|\bLIMIT\b|$))/gi,
     (_, cols) => `GROUP BY ${quoteExpr(cols.trim())}`
   );
 
-  /* 6. Cita identificadores no HAVING */
+  /* 7. HAVING */
   sql = sql.replace(
     /\bHAVING\b([\s\S]+?)(?=\s*(?:\bORDER\b|\bLIMIT\b|$))/gi,
     (_, cond) => `HAVING ${quoteExpr(cond.trim())}`
@@ -1414,15 +1453,20 @@ function applyFunctionConversions(sql) {
   /* ── Regra 7: GETDATE() → CURRENT_DATE ── */
   sql = sql.replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_DATE');
 
+  /* Padrão para capturar argumentos com até um nível de parênteses aninhados
+     Ex: VARCHAR(10), GETDATE(), T0.DocDate                                   */
+  const FUNC_ARGS = '((?:[^()]+|\\([^()]*\\))*)';
+  const FUNC_ARGS_RE = s => new RegExp(`\\b${s}\\s*\\(${FUNC_ARGS}\\)`, 'gi');
+
   /* ── Regra 8: DATEDIFF(unit, d1, d2) → DAYS_BETWEEN(d1, d2) ── */
-  sql = sql.replace(/\bDATEDIFF\s*\(([^()]+)\)/gi, (_, args) => {
+  sql = sql.replace(FUNC_ARGS_RE('DATEDIFF'), (_, args) => {
     const p = splitArgs(args);
     if (p.length >= 3) return `DAYS_BETWEEN(${p[1]}, ${p[2]})`;
     return `DAYS_BETWEEN(${p.slice(1).join(', ')})`;
   });
 
   /* ── Regra 8: DATEADD(unit, n, date) → ADD_DAYS(date, n) ── */
-  sql = sql.replace(/\bDATEADD\s*\(([^()]+)\)/gi, (_, args) => {
+  sql = sql.replace(FUNC_ARGS_RE('DATEADD'), (_, args) => {
     const p = splitArgs(args);
     if (p.length >= 3) return `ADD_DAYS(${p[2]}, ${p[1]})`;
     return `ADD_DAYS(${p.slice(1).join(', ')})`;
@@ -1432,14 +1476,14 @@ function applyFunctionConversions(sql) {
   sql = sql.replace(/\bLEN\s*\(/gi, 'LENGTH(');
 
   /* ── Regra 9: CHARINDEX(needle, haystack) → LOCATE(haystack, needle) ── */
-  sql = sql.replace(/\bCHARINDEX\s*\(([^()]+)\)/gi, (_, args) => {
+  sql = sql.replace(FUNC_ARGS_RE('CHARINDEX'), (_, args) => {
     const p = splitArgs(args);
     if (p.length >= 2) return `LOCATE(${p[1]}, ${p[0]})`;
     return `LOCATE(${args})`;
   });
 
-  /* ── Regra 11: CONVERT(VARCHAR, field, 103) → TO_VARCHAR(field, 'DD/MM/YYYY') ── */
-  sql = sql.replace(/\bCONVERT\s*\(([^()]+)\)/gi, (_, args) => {
+  /* ── Regra 11: CONVERT(VARCHAR(10), field, 103) → TO_VARCHAR(field, 'DD/MM/YYYY') ── */
+  sql = sql.replace(FUNC_ARGS_RE('CONVERT'), (_, args) => {
     const p = splitArgs(args);
     if (p.length >= 3) {
       const style = p[2].trim();
@@ -1495,7 +1539,7 @@ function convertTopToLimit(sql) {
   const n = m[1];
   sql = sql.replace(/\bSELECT\s+TOP\s+\d+\b/i, 'SELECT');
   sql = sql.trimEnd().replace(/\s*;?\s*$/, '');
-  if (!/\bLIMIT\s+\d+\s*$/i.test(sql)) sql += `\nLIMIT ${n}`;
+  if (!/\bLIMIT\s+\d+\s*$/i.test(sql)) sql += ` LIMIT ${n}`;
   return sql;
 }
 
