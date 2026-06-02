@@ -1207,6 +1207,31 @@ function fixSapFields(sql) {
   return sql.replace(/\$\[\$(\d+\.\d+)\]/g, '$$[$$$1.0]');
 }
 
+/* ── Normaliza identificadores delimitados do SQL Server [id] → HANA "id" ──
+   • [dbo].[Tabela]          → "Tabela"   (descarta o schema dbo. do SQL Server)
+   • T0.[ItemCode]           → T0."ItemCode"
+   • [ItemCode]              → "ItemCode"
+   • AS [Código do Item]     → AS "Código do Item"   (espaço/acento exigem aspas)
+   Respeita literais 'string' e refs SAP $[$...] — os colchetes internos deles
+   são protegidos e nunca convertidos.                                          */
+function normalizeBrackets(sql) {
+  const [safe, restore] = protectLiterals(sql);   /* protege '...' e $[$...] */
+  let s = safe;
+
+  /* Decide se um id precisa de aspas: sempre que cfg.quotes ligado, ou quando
+     contém caractere que não seja [A-Za-z0-9_] (espaço, acento, etc.) —
+     nesses casos o HANA EXIGE aspas. */
+  const wrap = id => (cfg.quotes || /[^A-Za-z0-9_]/.test(id)) ? `"${id}"` : id;
+
+  /* 1. [schema].[...].[tabela] → "tabela" (descarta qualificadores à esquerda) */
+  s = s.replace(/(?:\[[A-Za-z_]\w*\]\s*\.\s*)+\[([^\]]+)\]/g, (_, last) => wrap(last));
+
+  /* 2. [identificador] isolado → "identificador" */
+  s = s.replace(/\[([^\]]+)\]/g, (_, id) => wrap(id));
+
+  return restore(s);
+}
+
 /* Tokeniza um bloco FROM ... [JOIN ...] e retorna info das tabelas */
 function parseFromClause(fromBlock) {
   /* Detecta padrão: FROM tabA [alias] [INNER|LEFT|...] JOIN tabB [alias] ON ... */
@@ -1777,6 +1802,11 @@ function convertToHana(raw) {
   getCfg();
 
   let sql = raw;
+
+  /* 0. Normaliza colchetes do SQL Server [id] → HANA "id" (sempre roda;
+        o HANA não entende [..]). Precisa rodar ANTES de tudo para que as
+        regras seguintes vejam identificadores limpos/já citados.          */
+  sql = normalizeBrackets(sql);
 
   /* 1. SAP B1 field refs */
   if (cfg.sapfields) sql = fixSapFields(sql);
