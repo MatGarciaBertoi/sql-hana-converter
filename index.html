@@ -1207,6 +1207,56 @@ function fixSapFields(sql) {
   return sql.replace(/\$\[\$(\d+\.\d+)\]/g, '$$[$$$1.0]');
 }
 
+/* Remove table hints do SQL Server (WITH (NOLOCK) etc.) — o HANA não os suporta */
+function stripTableHints(sql) {
+  const HINT = 'NOLOCK|READUNCOMMITTED|READPAST|ROWLOCK|UPDLOCK|XLOCK|HOLDLOCK|TABLOCK|TABLOCKX|NOWAIT|FORCESEEK|FORCESCAN|INDEX\\s*\\([^)]*\\)';
+  sql = sql.replace(new RegExp(`\\bWITH\\s*\\(\\s*(?:${HINT})(?:\\s*,\\s*(?:${HINT}))*\\s*\\)`, 'gi'), '');
+  sql = sql.replace(/\(\s*NOLOCK\s*\)/gi, '');
+  return sql.replace(/[ \t]{2,}/g, ' ');
+}
+
+/* Protege comentários (-- e /* *​/) ANTES das rotas de conversão, para que
+   palavras-reservadas dentro deles (ex: "-- WHERE x") não sejam tratadas como
+   cláusulas reais nem recebam aspas. Pula strings 'x'/"x" e refs SAP $[$..]
+   para não confundir -- dentro de literal com início de comentário.         */
+function protectComments(sql) {
+  const map = {};
+  const n = sql.length;
+  let out = '', i = 0;
+  while (i < n) {
+    const c = sql[i], c2 = sql[i + 1];
+    if (c === '/' && c2 === '*') {
+      let j = sql.indexOf('*/', i + 2); j = j < 0 ? n : j + 2;
+      const k = `@@CMT${_litSeq++}@@`; map[k] = sql.slice(i, j); out += k; i = j; continue;
+    }
+    if (c === '-' && c2 === '-') {
+      let j = sql.indexOf('\n', i); j = j < 0 ? n : j;
+      const k = `@@CMT${_litSeq++}@@`; map[k] = sql.slice(i, j); out += k; i = j; continue;
+    }
+    if (c === "'") {                       /* pula string — não procura -- dentro */
+      let j = i + 1;
+      while (j < n) { if (sql[j] === "'") { if (sql[j + 1] === "'") { j += 2; continue; } j++; break; } j++; }
+      out += sql.slice(i, j); i = j; continue;
+    }
+    if (c === '"') {                       /* pula identificador "x" */
+      let j = i + 1; while (j < n && sql[j] !== '"') j++; j = j < n ? j + 1 : n;
+      out += sql.slice(i, j); i = j; continue;
+    }
+    out += c; i++;
+  }
+  const restore = t => t.replace(/@@CMT\d+@@/g, k => map[k] ?? k);
+  return [out, restore];
+}
+
+/* OFFSET n ROWS FETCH NEXT m ROWS ONLY → LIMIT m OFFSET n (paginação HANA) */
+function convertOffsetFetch(sql) {
+  sql = sql.replace(
+    /\bOFFSET\s+(\d+)\s+ROWS?\s+FETCH\s+(?:NEXT|FIRST)\s+(\d+)\s+ROWS?\s+ONLY\b/gi,
+    (_, off, lim) => `LIMIT ${lim} OFFSET ${off}`
+  );
+  return sql;
+}
+
 /* ── Normaliza identificadores delimitados do SQL Server [id] → HANA "id" ──
    • [dbo].[Tabela]          → "Tabela"   (descarta o schema dbo. do SQL Server)
    • T0.[ItemCode]           → T0."ItemCode"
@@ -1351,6 +1401,11 @@ const SQL_KWSET = new Set([
   /* funções HANA geradas pela conversão */
   'DAYS_BETWEEN','ADD_DAYS','EXTRACT','TO_VARCHAR','TO_NVARCHAR','IFNULL',
   'LENGTH','LOCATE',
+  'MONTHS_BETWEEN','YEARS_BETWEEN','SECONDS_BETWEEN','ADD_MONTHS','ADD_YEARS',
+  'ADD_SECONDS','TO_INTEGER','TO_BIGINT','TO_DECIMAL','TO_DOUBLE','TO_DATE',
+  'TO_TIMESTAMP','TO_TIME','LAST_DAY','CEIL','CEILING','FLOOR','ROUND','ABS',
+  'CURRENT_UTCTIMESTAMP','DATEPART','EOMONTH','IIF','LEFT','RIGHT','POWER','MOD',
+  'OFFSET','ONLY','FIRST',
 ]);
 
 /* Coloca aspas em um identificador se necessário */
@@ -1367,24 +1422,56 @@ function quoteWord(w) {
    chamada sobrescreve os tokens da primeira, corrompendo a saída.         */
 let _litSeq = 0;
 
+/* Scanner de passada única — robusto a aninhamentos e ordem:
+   protege, na ordem em que aparecem, comentários (/* *​/ e --),
+   refs SAP $[$...], strings 'valor' (com escape '') e identificadores "x".
+   Um único scan evita os bugs de ordem que regexes sequenciais causam
+   (ex: -- dentro de string, ' dentro de comentário).                      */
 function protectLiterals(text) {
   const map = {};
+  const n = text.length;
+  let out = '', i = 0;
+  const tok = (pfx, str) => { const k = `@@${pfx}${_litSeq++}@@`; map[k] = str; return k; };
 
-  /* Protege $[$...] SAP B1 */
-  text = text.replace(/\$\[\$[^\]]+\]/g, m => {
-    const k = `@@SAP${_litSeq++}@@`; map[k] = m; return k;
-  });
-  /* Protege identificadores já com aspas duplas */
-  text = text.replace(/"[^"]+"/g, m => {
-    const k = `@@DQ${_litSeq++}@@`; map[k] = m; return k;
-  });
-  /* Protege string literals 'valor' */
-  text = text.replace(/'[^']*'/g, m => {
-    const k = `@@STR${_litSeq++}@@`; map[k] = m; return k;
-  });
+  while (i < n) {
+    const c = text[i], c2 = text[i + 1];
 
-  const restore = t => t.replace(/@@(?:SAP|DQ|STR)\d+@@/g, k => map[k] ?? k);
-  return [text, restore];
+    /* comentário de bloco */
+    if (c === '/' && c2 === '*') {
+      let j = text.indexOf('*/', i + 2); j = j < 0 ? n : j + 2;
+      out += tok('CMT', text.slice(i, j)); i = j; continue;
+    }
+    /* comentário de linha */
+    if (c === '-' && c2 === '-') {
+      let j = text.indexOf('\n', i); j = j < 0 ? n : j;
+      out += tok('CMT', text.slice(i, j)); i = j; continue;
+    }
+    /* ref SAP B1 $[$...] */
+    if (c === '$' && c2 === '[' && text[i + 2] === '$') {
+      let j = text.indexOf(']', i); j = j < 0 ? n : j + 1;
+      out += tok('SAP', text.slice(i, j)); i = j; continue;
+    }
+    /* string 'valor' (com escape '') */
+    if (c === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (text[j] === "'") { if (text[j + 1] === "'") { j += 2; continue; } j++; break; }
+        j++;
+      }
+      out += tok('STR', text.slice(i, j)); i = j; continue;
+    }
+    /* identificador "x" já com aspas */
+    if (c === '"') {
+      let j = i + 1;
+      while (j < n && text[j] !== '"') j++;
+      j = j < n ? j + 1 : n;
+      out += tok('DQ', text.slice(i, j)); i = j; continue;
+    }
+    out += c; i++;
+  }
+
+  const restore = t => t.replace(/@@(?:SAP|DQ|STR|CMT)\d+@@/g, k => map[k] ?? k);
+  return [out, restore];
 }
 
 /* Cita expr respeitando alias.coluna → alias."coluna"
@@ -1699,32 +1786,125 @@ function formatSQL(sql) {
   return restore(s.trim());
 }
 
+/* Mapeia um tipo SQL Server → função de conversão HANA TO_xxx(expr).
+   Aceita tipo com tamanho (ex: "DECIMAL(18,2)", "VARCHAR(10)").
+   Retorna a string convertida ou null se o tipo não for reconhecido.    */
+function hanaCast(typeRaw, expr) {
+  const sizeM = typeRaw.match(/\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)/);
+  const nums  = sizeM ? [sizeM[1], sizeM[2]].filter(Boolean) : [];
+  const T = typeRaw.replace(/\(.*/, '').trim().toUpperCase();
+  switch (T) {
+    case 'INT': case 'INTEGER': case 'SMALLINT': case 'TINYINT': case 'BIT':
+      return `TO_INTEGER(${expr})`;
+    case 'BIGINT':
+      return `TO_BIGINT(${expr})`;
+    case 'DECIMAL': case 'NUMERIC': case 'MONEY': case 'SMALLMONEY':
+      return nums.length ? `TO_DECIMAL(${expr}, ${nums.join(', ')})` : `TO_DECIMAL(${expr})`;
+    case 'FLOAT': case 'REAL': case 'DOUBLE':
+      return `TO_DOUBLE(${expr})`;
+    case 'DATE':
+      return `TO_DATE(${expr})`;
+    case 'DATETIME': case 'DATETIME2': case 'SMALLDATETIME': case 'TIMESTAMP':
+      return `TO_TIMESTAMP(${expr})`;
+    case 'TIME':
+      return `TO_TIME(${expr})`;
+    case 'NVARCHAR': case 'NCHAR': case 'NTEXT':
+      return `TO_NVARCHAR(${expr})`;
+    case 'VARCHAR': case 'CHAR': case 'TEXT':
+      return `TO_VARCHAR(${expr})`;
+    default:
+      return null;
+  }
+}
+
 function applyFunctionConversions(sql) {
 
   /* ── Regra 6: ISNULL → IFNULL ── */
   sql = sql.replace(/\bISNULL\s*\(/gi, 'IFNULL(');
 
-  /* ── Regra 7: GETDATE() → CURRENT_DATE ── */
+  /* ── Regra 7: GETUTCDATE() → CURRENT_UTCTIMESTAMP / GETDATE() → CURRENT_DATE ── */
+  sql = sql.replace(/\bGETUTCDATE\s*\(\s*\)/gi, 'CURRENT_UTCTIMESTAMP');
   sql = sql.replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_DATE');
 
   /* Padrão para capturar argumentos com até um nível de parênteses aninhados
      Ex: VARCHAR(10), GETDATE(), T0.DocDate                                   */
   const FUNC_ARGS = '((?:[^()]+|\\([^()]*\\))*)';
   const FUNC_ARGS_RE = s => new RegExp(`\\b${s}\\s*\\(${FUNC_ARGS}\\)`, 'gi');
+  const unitOf = s => s.trim().toUpperCase().replace(/[^A-Z]/g, '');
 
-  /* ── Regra 8: DATEDIFF(unit, d1, d2) → DAYS_BETWEEN(d1, d2) ── */
+  /* ── Regra 8: DATEDIFF(unit, d1, d2) → função _BETWEEN conforme a unidade ── */
+  const DIFF_MAP = {
+    YEAR:'YEARS_BETWEEN', YY:'YEARS_BETWEEN', YYYY:'YEARS_BETWEEN',
+    QUARTER:'QUARTER', QQ:'QUARTER', Q:'QUARTER',
+    MONTH:'MONTHS_BETWEEN', MM:'MONTHS_BETWEEN', M:'MONTHS_BETWEEN',
+    DAY:'DAYS_BETWEEN', DD:'DAYS_BETWEEN', D:'DAYS_BETWEEN', DAYOFYEAR:'DAYS_BETWEEN', DY:'DAYS_BETWEEN',
+    WEEK:'WEEK', WK:'WEEK', WW:'WEEK',
+    HOUR:'HOUR', HH:'HOUR',
+    MINUTE:'MINUTE', MI:'MINUTE', N:'MINUTE',
+    SECOND:'SECONDS_BETWEEN', SS:'SECONDS_BETWEEN', S:'SECONDS_BETWEEN',
+  };
   sql = sql.replace(FUNC_ARGS_RE('DATEDIFF'), (_, args) => {
     const p = splitArgs(args);
-    if (p.length >= 3) return `DAYS_BETWEEN(${p[1]}, ${p[2]})`;
-    return `DAYS_BETWEEN(${p.slice(1).join(', ')})`;
+    if (p.length < 3) return `DAYS_BETWEEN(${p.slice(1).join(', ')})`;
+    const fn = DIFF_MAP[unitOf(p[0])] || 'DAYS_BETWEEN';
+    const d1 = p[1].trim(), d2 = p[2].trim();
+    if (fn === 'WEEK')    return `(DAYS_BETWEEN(${d1}, ${d2}) / 7)`;
+    if (fn === 'QUARTER') return `(MONTHS_BETWEEN(${d1}, ${d2}) / 3)`;
+    if (fn === 'HOUR')    return `(SECONDS_BETWEEN(${d1}, ${d2}) / 3600)`;
+    if (fn === 'MINUTE')  return `(SECONDS_BETWEEN(${d1}, ${d2}) / 60)`;
+    return `${fn}(${d1}, ${d2})`;
   });
 
-  /* ── Regra 8: DATEADD(unit, n, date) → ADD_DAYS(date, n) ── */
+  /* ── Regra 8: DATEADD(unit, n, date) → ADD_* conforme a unidade ── */
+  const ADD_MAP = {
+    YEAR:'ADD_YEARS', YY:'ADD_YEARS', YYYY:'ADD_YEARS',
+    QUARTER:'QUARTER', QQ:'QUARTER', Q:'QUARTER',
+    MONTH:'ADD_MONTHS', MM:'ADD_MONTHS', M:'ADD_MONTHS',
+    DAY:'ADD_DAYS', DD:'ADD_DAYS', D:'ADD_DAYS',
+    WEEK:'WEEK', WK:'WEEK', WW:'WEEK',
+    HOUR:'HOUR', HH:'HOUR', MINUTE:'MINUTE', MI:'MINUTE', N:'MINUTE',
+    SECOND:'SECOND', SS:'SECOND', S:'SECOND',
+  };
   sql = sql.replace(FUNC_ARGS_RE('DATEADD'), (_, args) => {
     const p = splitArgs(args);
-    if (p.length >= 3) return `ADD_DAYS(${p[2]}, ${p[1]})`;
-    return `ADD_DAYS(${p.slice(1).join(', ')})`;
+    if (p.length < 3) return `ADD_DAYS(${p.slice(1).join(', ')})`;
+    const fn = ADD_MAP[unitOf(p[0])] || 'ADD_DAYS';
+    const n = p[1].trim(), date = p[2].trim();
+    if (fn === 'WEEK')    return `ADD_DAYS(${date}, (${n}) * 7)`;
+    if (fn === 'QUARTER') return `ADD_MONTHS(${date}, (${n}) * 3)`;
+    if (fn === 'HOUR')    return `ADD_SECONDS(${date}, (${n}) * 3600)`;
+    if (fn === 'MINUTE')  return `ADD_SECONDS(${date}, (${n}) * 60)`;
+    if (fn === 'SECOND')  return `ADD_SECONDS(${date}, ${n})`;
+    return `${fn}(${date}, ${n})`;
   });
+
+  /* ── DATEPART(unit, date) → EXTRACT(UNIT FROM date) ── */
+  const PART_MAP = {
+    YEAR:'YEAR', YY:'YEAR', YYYY:'YEAR', MONTH:'MONTH', MM:'MONTH', M:'MONTH',
+    DAY:'DAY', DD:'DAY', D:'DAY', HOUR:'HOUR', HH:'HOUR',
+    MINUTE:'MINUTE', MI:'MINUTE', N:'MINUTE', SECOND:'SECOND', SS:'SECOND', S:'SECOND',
+  };
+  sql = sql.replace(FUNC_ARGS_RE('DATEPART'), (_, args) => {
+    const p = splitArgs(args);
+    if (p.length < 2) return `DATEPART(${args})`;
+    return `EXTRACT(${PART_MAP[unitOf(p[0])] || unitOf(p[0])} FROM ${p[1].trim()})`;
+  });
+
+  /* ── EOMONTH(date) → LAST_DAY(date) ── */
+  sql = sql.replace(FUNC_ARGS_RE('EOMONTH'), (_, args) => {
+    const p = splitArgs(args);
+    return `LAST_DAY(${p[0].trim()})`;
+  });
+
+  /* ── IIF(cond, a, b) → CASE WHEN cond THEN a ELSE b END ── */
+  sql = sql.replace(FUNC_ARGS_RE('IIF'), (_, args) => {
+    const p = splitArgs(args);
+    if (p.length === 3) return `CASE WHEN ${p[0].trim()} THEN ${p[1].trim()} ELSE ${p[2].trim()} END`;
+    return `IIF(${args})`;
+  });
+
+  /* ── CEILING → CEIL ── */
+  sql = sql.replace(/\bCEILING\s*\(/gi, 'CEIL(');
 
   /* ── Regra 9: LEN → LENGTH ── */
   sql = sql.replace(/\bLEN\s*\(/gi, 'LENGTH(');
@@ -1750,19 +1930,16 @@ function applyFunctionConversions(sql) {
       if (type.startsWith('VARCHAR') || type.startsWith('CHAR')) return `TO_VARCHAR(${field})`;
     }
     if (p.length === 2) {
-      const type = p[0].trim().toUpperCase();
-      if (type.startsWith('NVARCHAR')) return `TO_NVARCHAR(${p[1]})`;
-      if (type.startsWith('VARCHAR'))  return `TO_VARCHAR(${p[1]})`;
+      const conv = hanaCast(p[0].trim(), p[1].trim());
+      if (conv) return conv;
     }
     return `CONVERT(${args})`; /* não reconhecido — mantém */
   });
 
-  /* ── Regra 11: CAST(expr AS NVARCHAR/VARCHAR) → TO_NVARCHAR / TO_VARCHAR ── */
+  /* ── Regra 11: CAST(expr AS TIPO) → TO_xxx(expr) (todos os tipos comuns) ── */
   sql = sql.replace(
-    /\bCAST\s*\(\s*([\s\S]+?)\s+AS\s+(N?VARCHAR(?:\s*\(\d+\))?|NVARCHAR|VARCHAR)\s*\)/gi,
-    (_, expr, type) => type.toUpperCase().startsWith('N')
-      ? `TO_NVARCHAR(${expr.trim()})`
-      : `TO_VARCHAR(${expr.trim()})`
+    /\bCAST\s*\(\s*([\s\S]+?)\s+AS\s+([A-Za-z][A-Za-z0-9_]*)(\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?\s*\)/gi,
+    (m, expr, type, sizePart) => hanaCast((type + (sizePart || '')).trim(), expr.trim()) || m
   );
 
   /* ── Regra 12: YEAR/MONTH/DAY(expr) → EXTRACT(UNIT FROM expr) ── */
@@ -1803,10 +1980,18 @@ function convertToHana(raw) {
 
   let sql = raw;
 
+  /* 0a. Protege comentários para que nada dentro deles seja convertido/citado.
+         Restaurado no final (restoreComments) antes de devolver.            */
+  const [sqlNoCmt, restoreComments] = protectComments(sql);
+  sql = sqlNoCmt;
+
   /* 0. Normaliza colchetes do SQL Server [id] → HANA "id" (sempre roda;
         o HANA não entende [..]). Precisa rodar ANTES de tudo para que as
         regras seguintes vejam identificadores limpos/já citados.          */
   sql = normalizeBrackets(sql);
+
+  /* 0b. Remove table hints do SQL Server (WITH (NOLOCK) etc.) */
+  sql = stripTableHints(sql);
 
   /* 1. SAP B1 field refs */
   if (cfg.sapfields) sql = fixSapFields(sql);
@@ -1816,6 +2001,9 @@ function convertToHana(raw) {
 
   /* 3. TOP N → LIMIT N (regra 10) */
   sql = convertTopToLimit(sql);
+
+  /* 3c. OFFSET..FETCH → LIMIT..OFFSET (paginação) */
+  sql = convertOffsetFetch(sql);
 
   /* 4. Keywords uppercase */
   if (cfg.uppercase) sql = upKeywords(sql);
@@ -1829,14 +2017,14 @@ function convertToHana(raw) {
   /* 3a. Rota SIMPLES: sem JOIN, sem CASE, sem subselect */
   if (isSimple) {
     if (cfg.quotes) sql = convertSimpleQuery(sql);
-    return sql.trim();
+    return restoreComments(sql.trim());
   }
 
   /* 3b. Rota COMPLEXA: lógica existente */
 
-  /* Detecta se precisa de FROM DUMMY */
-  const hasToplevelFrom = /^\s*SELECT\b[\s\S]+?\bFROM\b(?!\s*DUMMY)/im.test(sql) &&
-                          !/^\s*SELECT\s*\n?\s*CASE/i.test(sql);
+  /* Detecta se há um FROM real (profundidade 0, não DUMMY). FROMs dentro de
+     subqueries/parênteses não contam — esses precisam de FROM DUMMY no topo. */
+  const hasToplevelFrom = hasTopLevelFrom(sql);
 
   /* Converte subselects dentro de IN(...) */
   sql = sql.replace(
@@ -1864,7 +2052,29 @@ function convertToHana(raw) {
     if (!/FROM\s+DUMMY\s*$/i.test(sql)) sql += '\nFROM DUMMY';
   }
 
-  return sql;
+  return restoreComments(sql);
+}
+
+/* Detecta FROM em profundidade 0 de parênteses, não seguido de DUMMY.
+   Ignora literais/comentários (protegidos) e FROMs em subqueries.        */
+function hasTopLevelFrom(sql) {
+  const [s] = protectLiterals(sql);
+  let depth = 0, i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '(') { depth++; i++; continue; }
+    if (c === ')') { depth--; i++; continue; }
+    if (depth === 0 && (c === 'F' || c === 'f') && /^FROM\b/i.test(s.slice(i))) {
+      const bef = i > 0 ? s[i - 1] : ' ';
+      if (!/[A-Za-z0-9_]/.test(bef)) {
+        const after = s.slice(i + 4).replace(/^\s+/, '');
+        if (!/^DUMMY\b/i.test(after)) return true;
+      }
+      i += 4; continue;
+    }
+    i++;
+  }
+  return false;
 }
 
 /* Reformata CASE WHEN com indentação limpa */
